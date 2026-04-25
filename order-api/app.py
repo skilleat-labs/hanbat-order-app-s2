@@ -6,16 +6,22 @@ order-api · 한밭푸드 주문 조회 서비스 (시즌 2)
     → payment-api 에 동기 호출 (httpx AsyncClient)
     → 주문 + 결제 정보를 합쳐서 응답
 
-Phase 1 상태: 타임아웃 설정 없음 (의도적 — 장애 전파 체험용)
-Phase 2에서 학생이 Retry + Circuit Breaker 를 추가할 예정
+Phase 2 상태: Timeout(2초) + Retry(503/Timeout, 최대 3회) + Circuit Breaker(5회 실패 시 Open)
 """
 
 import os
 import time
 
 import httpx
+import pybreaker
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 app = FastAPI(title="order-api", version="1.0.0")
 
@@ -30,6 +36,16 @@ app.add_middleware(
 # 설정
 # ---------------------------------------------------------------------------
 PAYMENT_API_URL: str = os.getenv("PAYMENT_API_URL", "http://payment-api:8080")
+
+# ---------------------------------------------------------------------------
+# Circuit Breaker
+# fail_max=5  : 연속 5회 실패 시 Open (요청 차단)
+# reset_timeout=10 : 10초 후 Half-Open (복구 테스트)
+# ---------------------------------------------------------------------------
+payment_breaker = pybreaker.CircuitBreaker(
+    fail_max=5,
+    reset_timeout=10,
+)
 
 # ---------------------------------------------------------------------------
 # 샘플 주문 데이터
@@ -48,17 +64,39 @@ async def health():
     return {"status": "ok", "service": "order-api"}
 
 
+# ---------------------------------------------------------------------------
+# Retry 조건 — Timeout 또는 503일 때만 재시도
+# ---------------------------------------------------------------------------
+def _is_retryable(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 503
+    return False
+
+
+@retry(
+    retry=retry_if_exception(_is_retryable),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=4),
+    reraise=True,
+)
+async def _fetch_payment_raw(order_id: str) -> dict:
+    """payment-api 단순 호출 (Retry가 감싸는 실제 함수)"""
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        resp = await client.get(f"{PAYMENT_API_URL}/api/payments/{order_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _fetch_payment(order_id: str) -> dict:
+    """Circuit Breaker + Retry 래핑"""
+    return await payment_breaker.call_async(_fetch_payment_raw, order_id)
+
+
 @app.get("/api/orders/{order_id}")
 async def get_order(order_id: str):
-    """
-    주문 + 결제 정보 통합 조회
-
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │ Phase 1 실습 포인트                                                  │
-    │  payment-api 가 느려지면 이 API도 함께 느려집니다.                   │
-    │  타임아웃이 없으므로 스레드/커넥션이 쌓여 전체 장애로 번집니다.      │
-    └─────────────────────────────────────────────────────────────────────┘
-    """
+    """주문 + 결제 정보 통합 조회 (Phase 2: Timeout + Retry + Circuit Breaker 적용)"""
     order = ORDERS.get(order_id)
     if not order:
         raise HTTPException(
@@ -68,43 +106,29 @@ async def get_order(order_id: str):
 
     start = time.monotonic()
 
-    # -----------------------------------------------------------------------
-    # payment-api 호출
-    #
-    # ⚠️  Phase 1: timeout=None (타임아웃 없음) — 이것이 연쇄 장애의 원인!
-    #              payment-api 가 8초 응답하면 이 커넥션도 8초 블록됩니다.
-    #
-    # 💡 Phase 2 TODO: 아래 httpx.AsyncClient 생성 부분을 수정하여
-    #                  Retry + Circuit Breaker 를 추가하세요.
-    #
-    #    [STEP 1] timeout 추가:
-    #      async with httpx.AsyncClient(timeout=2.0) as client:
-    #
-    #    [STEP 2] tenacity 로 Retry 래핑 (retry.py 별도 모듈 권장)
-    #
-    #    [STEP 3] pybreaker 로 Circuit Breaker 래핑
-    #      payment_breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=30)
-    # -----------------------------------------------------------------------
-    async with httpx.AsyncClient(timeout=None) as client:  # ← Phase 2에서 수정
-        try:
-            resp = await client.get(f"{PAYMENT_API_URL}/api/payments/{order_id}")
-            resp.raise_for_status()
-            payment = resp.json()
-        except httpx.TimeoutException:
-            raise HTTPException(
-                status_code=504,
-                detail={"error": "PAYMENT_API_TIMEOUT", "order_id": order_id},
-            )
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(
-                status_code=502,
-                detail={"error": "PAYMENT_API_ERROR", "upstream_status": e.response.status_code},
-            )
-        except httpx.RequestError as e:
-            raise HTTPException(
-                status_code=502,
-                detail={"error": "PAYMENT_API_UNREACHABLE", "detail": str(e)},
-            )
+    try:
+        payment = await _fetch_payment(order_id)
+    except pybreaker.CircuitBreakerError:
+        # Circuit Breaker Open — 결제 서비스 차단 중, Fallback 응답
+        payment = {
+            "status": "조회불가",
+            "message": "결제 서비스 일시 중단 — 잠시 후 다시 시도해주세요",
+        }
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail={"error": "PAYMENT_API_TIMEOUT", "order_id": order_id},
+        )
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "PAYMENT_API_ERROR", "upstream_status": e.response.status_code},
+        )
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "PAYMENT_API_UNREACHABLE", "detail": str(e)},
+        )
 
     elapsed_ms = int((time.monotonic() - start) * 1000)
 
