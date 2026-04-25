@@ -13,7 +13,7 @@ import os
 import time
 
 import httpx
-import pybreaker
+from circuitbreaker import CircuitBreakerError, circuit
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from tenacity import (
@@ -36,16 +36,6 @@ app.add_middleware(
 # 설정
 # ---------------------------------------------------------------------------
 PAYMENT_API_URL: str = os.getenv("PAYMENT_API_URL", "http://payment-api:8080")
-
-# ---------------------------------------------------------------------------
-# Circuit Breaker
-# fail_max=5  : 연속 5회 실패 시 Open (요청 차단)
-# reset_timeout=10 : 10초 후 Half-Open (복구 테스트)
-# ---------------------------------------------------------------------------
-payment_breaker = pybreaker.CircuitBreaker(
-    fail_max=5,
-    reset_timeout=10,
-)
 
 # ---------------------------------------------------------------------------
 # 샘플 주문 데이터
@@ -75,23 +65,23 @@ def _is_retryable(exc: BaseException) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Circuit Breaker + Retry
+# @circuit  : 5회 연속 실패 시 Open, 10초 후 Half-Open
+# @retry    : Timeout 또는 503일 때 최대 3회 재시도
+# ---------------------------------------------------------------------------
+@circuit(failure_threshold=5, recovery_timeout=10)
 @retry(
     retry=retry_if_exception(_is_retryable),
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=4),
     reraise=True,
 )
-async def _fetch_payment_raw(order_id: str) -> dict:
-    """payment-api 단순 호출 (Retry가 감싸는 실제 함수)"""
+async def _fetch_payment(order_id: str) -> dict:
     async with httpx.AsyncClient(timeout=2.0) as client:
         resp = await client.get(f"{PAYMENT_API_URL}/api/payments/{order_id}")
         resp.raise_for_status()
         return resp.json()
-
-
-async def _fetch_payment(order_id: str) -> dict:
-    """Circuit Breaker + Retry 래핑"""
-    return await payment_breaker.call_async(_fetch_payment_raw, order_id)
 
 
 @app.get("/api/orders/{order_id}")
@@ -108,7 +98,7 @@ async def get_order(order_id: str):
 
     try:
         payment = await _fetch_payment(order_id)
-    except pybreaker.CircuitBreakerError:
+    except CircuitBreakerError:
         # Circuit Breaker Open — 결제 서비스 차단 중, Fallback 응답
         payment = {
             "status": "조회불가",
