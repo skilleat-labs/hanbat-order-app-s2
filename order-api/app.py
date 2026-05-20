@@ -17,6 +17,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+
 app = FastAPI(title="order-api", version="1.0.0")
 
 app.add_middleware(
@@ -50,15 +51,6 @@ async def health():
 
 @app.get("/api/orders/{order_id}")
 async def get_order(order_id: str):
-    """
-    주문 + 결제 정보 통합 조회
-
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │ Phase 1 실습 포인트                                                  │
-    │  payment-api 가 느려지면 이 API도 함께 느려집니다.                   │
-    │  타임아웃이 없으므로 스레드/커넥션이 쌓여 전체 장애로 번집니다.      │
-    └─────────────────────────────────────────────────────────────────────┘
-    """
     order = ORDERS.get(order_id)
     if not order:
         raise HTTPException(
@@ -68,23 +60,15 @@ async def get_order(order_id: str):
 
     start = time.monotonic()
 
-    # -----------------------------------------------------------------------
-    # payment-api 호출
-    #
     # ⚠️  Phase 1: timeout=None (타임아웃 없음) — 이것이 연쇄 장애의 원인!
-    #              payment-api 가 8초 응답하면 이 커넥션도 8초 블록됩니다.
     #
-    # 💡 Phase 2 TODO: 아래 httpx.AsyncClient 생성 부분을 수정하여
-    #                  Retry + Circuit Breaker 를 추가하세요.
-    #
+    # 💡 Phase 2 TODO:
     #    [STEP 1] timeout 추가:
     #      async with httpx.AsyncClient(timeout=2.0) as client:
     #
-    #    [STEP 2] tenacity 로 Retry 래핑 (retry.py 별도 모듈 권장)
+    #    [STEP 2] tenacity 로 Retry 래핑
     #
-    #    [STEP 3] pybreaker 로 Circuit Breaker 래핑
-    #      payment_breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=30)
-    # -----------------------------------------------------------------------
+    #    [STEP 3] circuitbreaker 로 Circuit Breaker 래핑
     async with httpx.AsyncClient(timeout=None) as client:  # ← Phase 2에서 수정
         try:
             resp = await client.get(f"{PAYMENT_API_URL}/api/payments/{order_id}")
