@@ -60,11 +60,35 @@ async def get_order(order_id: str):
 
     start = time.monotonic()
 
-    # Phase 1: timeout 없음 — payment-api가 느려지면 이 스레드도 같이 멈춤
-    # Phase 2에서 Retry + Circuit Breaker 로 개선 예정
-    async with httpx.AsyncClient(timeout=None) as client:
-        resp = await client.get(f"{PAYMENT_API_URL}/api/payments/{order_id}")
-        payment = resp.json()
+    # ⚠️  Phase 1: timeout=None (타임아웃 없음) — 이것이 연쇄 장애의 원인!
+    #
+    # 💡 Phase 2 TODO:
+    #    [STEP 1] timeout 추가:
+    #      async with httpx.AsyncClient(timeout=2.0) as client:
+    #
+    #    [STEP 2] tenacity 로 Retry 래핑
+    #
+    #    [STEP 3] circuitbreaker 로 Circuit Breaker 래핑
+    async with httpx.AsyncClient(timeout=None) as client:  # ← Phase 2에서 수정
+        try:
+            resp = await client.get(f"{PAYMENT_API_URL}/api/payments/{order_id}")
+            resp.raise_for_status()
+            payment = resp.json()
+        except httpx.TimeoutException:
+            raise HTTPException(
+                status_code=504,
+                detail={"error": "PAYMENT_API_TIMEOUT", "order_id": order_id},
+            )
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(
+                status_code=502,
+                detail={"error": "PAYMENT_API_ERROR", "upstream_status": e.response.status_code},
+            )
+        except httpx.RequestError as e:
+            raise HTTPException(
+                status_code=502,
+                detail={"error": "PAYMENT_API_UNREACHABLE", "detail": str(e)},
+            )
 
     elapsed_ms = int((time.monotonic() - start) * 1000)
 
